@@ -30,11 +30,15 @@ For a one-off run without installing: `pi -e git:github.com/OleMussmann/pi-reque
    reference looks like `requesty/openai/gpt-5-mini`.
 3. Chat. Costs in the footer use Requesty's catalog pricing (USD per million tokens).
 
-Check credential resolution with:
+Check your key with either:
 
-```bash
-pi auth check --provider requesty   # prints ready / not_ready / invalid
-```
+- **In a session** — run `/requesty`. It reports where the key came from
+  (auth.json, environment, ...), validates it live against Requesty
+  (a rejected key shows as `HTTP 403`), and shows the org catalog size next
+  to the number of models Pi can actually use.
+- **From the shell** — `pi --list-models requesty` loads extensions and prints
+  the requesty models when the credential resolves; `No models matching
+  "requesty"` means it does not.
 
 `REQUESTY_API_KEY` is not consulted — this extension deliberately keeps the key in
 `auth.json` only.
@@ -55,8 +59,9 @@ pi auth check --provider requesty   # prints ready / not_ready / invalid
   (the catalog is then scoped to models approved for your organization) and retries
   unauthenticated if the key is rejected (HTTP 401/403). A bad key therefore still
   gets models; it fails loudly only when actually chatting.
-- `pi auth check --provider requesty` reports `provider_not_found`: on Pi 1.2.0 the
-  auth commands run before extensions load, so they only know built-in providers.
+- `pi auth check --provider requesty` always reports `not_ready` (`provider_not_found`
+  with `--json`): the auth subcommands run before extensions load, so they only know
+  built-in providers. Use `/requesty` or `pi --list-models requesty` instead.
 
 ## Development
 

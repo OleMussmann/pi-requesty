@@ -26,6 +26,19 @@ const CATALOG_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 /** Upper bound on the startup catalog fetch; a failure just means no bootstrap models. */
 const BOOTSTRAP_TIMEOUT_MS = 10_000;
 
+/** Upper bound on the live key check in the /requesty command. */
+const CHECK_TIMEOUT_MS = 10_000;
+
+/** Human-readable names for Pi credential sources in the /requesty command. */
+const SOURCE_LABELS: Record<string, string> = {
+	stored: "auth.json",
+	runtime: "runtime --api-key",
+	environment: "environment variable",
+	fallback: "fallback key",
+	models_json_key: "models.json apiKey",
+	models_json_command: "models.json command",
+};
+
 /** Fallbacks for catalog entries with missing or zero metadata. */
 const FALLBACK_CONTEXT_WINDOW = 128_000;
 const FALLBACK_MAX_TOKENS = 16_384;
@@ -165,5 +178,55 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		api: "openai-completions",
 		models,
 		refreshModels,
+	});
+
+	// `pi auth check` cannot see extension providers: its subcommand runs before
+	// extensions load and reports provider_not_found as not_ready. This command is
+	// the in-session equivalent, plus a live validation against Requesty itself.
+	pi.registerCommand("requesty", {
+		description: "Check the Requesty API key and model catalog",
+		handler: async (_args, ctx) => {
+			const status = ctx.modelRegistry.getProviderAuthStatus(PROVIDER_ID);
+			const available = ctx.modelRegistry.getAvailable().filter((model) => model.provider === PROVIDER_ID);
+			const key = await ctx.modelRegistry.getApiKeyForProvider(PROVIDER_ID);
+			if (!status.configured || !key) {
+				ctx.ui.notify(
+					`Requesty API key: not configured — run /login requesty\nRegistered models: ${available.length} available`,
+					"warning",
+				);
+				return;
+			}
+			const source = status.source ? ` (${SOURCE_LABELS[status.source] ?? status.source})` : "";
+			let response: Response;
+			try {
+				response = await fetch(`${DEFAULT_BASE_URL}/models`, {
+					headers: { Authorization: `Bearer ${key}` },
+					signal: AbortSignal.timeout(CHECK_TIMEOUT_MS),
+				});
+			} catch (error) {
+				ctx.ui.notify(
+					`Requesty API key: stored${source}, but Requesty is unreachable\n${String(error)}`,
+					"warning",
+				);
+				return;
+			}
+			if (response.status === 401 || response.status === 403) {
+				ctx.ui.notify(
+					`Requesty API key: REJECTED by Requesty (HTTP ${response.status})\nRun /login requesty to replace it.`,
+					"error",
+				);
+				return;
+			}
+			if (!response.ok) {
+				ctx.ui.notify(`Requesty catalog check: HTTP ${response.status} ${response.statusText}`, "warning");
+				return;
+			}
+			const payload = (await response.json()) as { data?: RequestyModelEntry[] };
+			const orgModels = (payload.data ?? []).filter(isChatEntry).length;
+			ctx.ui.notify(
+				`Requesty API key: valid${source}\nOrg catalog: ${orgModels} chat models · ${available.length} available in Pi`,
+				"info",
+			);
+		},
 	});
 }
