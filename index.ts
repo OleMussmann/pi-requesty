@@ -1,11 +1,17 @@
 /**
  * pi-requesty — Requesty (https://requesty.ai) model provider for Pi.
  *
- * Registers "requesty" as a model provider whose catalog is refreshed from
- * Requesty's GET /v1/models endpoint. Streaming and Bearer authentication are
- * handled by Pi's built-in OpenAI Chat Completions implementation, so this
- * extension ships no stream code. The API key lives in auth.json and is
- * entered through `/login requesty`.
+ * Registers "requesty" as a model provider with a catalog discovered from
+ * Requesty's GET /v1/models endpoint:
+ *
+ * - The async factory fetches the public catalog once per startup (Pi waits
+ *   for async factories), so models exist before any refresh pass runs and an
+ *   empty store can never deadlock discovery.
+ * - refreshModels restores the persisted catalog offline, refreshes the
+ *   key-scoped catalog at most once a day, and persists successful fetches.
+ * - Streaming and Bearer authentication come from Pi's built-in OpenAI Chat
+ *   Completions implementation; the API key lives in auth.json via
+ *   `/login requesty`.
  */
 
 import type { Model, RefreshModelsContext } from "@earendil-works/pi-ai";
@@ -14,8 +20,11 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 const PROVIDER_ID = "requesty";
 const DEFAULT_BASE_URL = "https://router.requesty.ai/v1";
 
-/** Re-fetch the remote catalog at most this often (a forced refresh bypasses it). */
+/** Re-fetch the key-scoped catalog at most this often (a forced refresh bypasses it). */
 const CATALOG_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
+/** Upper bound on the startup catalog fetch; a failure just means no bootstrap models. */
+const BOOTSTRAP_TIMEOUT_MS = 10_000;
 
 /** Fallbacks for catalog entries with missing or zero metadata. */
 const FALLBACK_CONTEXT_WINDOW = 128_000;
@@ -35,6 +44,11 @@ interface RequestyModelEntry {
 	supports_reasoning?: boolean;
 }
 
+type RequestyModel = Model<"openai-completions">;
+
+/** Catalog fetched by the factory; serves refresh passes until the store has data. */
+let bootstrapModels: RequestyModel[] | undefined;
+
 function isChatEntry(entry: RequestyModelEntry): entry is RequestyModelEntry & { id: string } {
 	return entry.api === "chat" && typeof entry.id === "string" && entry.id.length > 0;
 }
@@ -48,7 +62,7 @@ function perMillion(value: number | undefined): number {
 	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value * 1_000_000 : 0;
 }
 
-function mapModel(entry: RequestyModelEntry & { id: string }, baseUrl: string): Model<"openai-completions"> {
+function mapModel(entry: RequestyModelEntry & { id: string }, baseUrl: string): RequestyModel {
 	const contextWindow = positiveInt(entry.context_window, FALLBACK_CONTEXT_WINDOW);
 	return {
 		type: "chat",
@@ -70,18 +84,45 @@ function mapModel(entry: RequestyModelEntry & { id: string }, baseUrl: string): 
 	};
 }
 
-export async function refreshModels(context: RefreshModelsContext): Promise<Model<"openai-completions">[]> {
+/**
+ * Fetch and map the catalog. A rejected or absent key (HTTP 401/403) still
+ * deserves model discovery: retry unauthenticated for the public catalog.
+ * Chat requests keep using the key, so a bad key fails loudly there instead
+ * of hiding models.
+ */
+async function fetchCatalog(
+	baseUrl: string,
+	apiKey: string | undefined,
+	signal?: AbortSignal,
+): Promise<RequestyModel[]> {
+	const fetchCatalogRequest = (headers: HeadersInit | undefined) =>
+		fetch(`${baseUrl}/models`, { headers, signal });
+	let response = await fetchCatalogRequest(apiKey ? { Authorization: `Bearer ${apiKey}` } : undefined);
+	if ((response.status === 401 || response.status === 403) && apiKey) {
+		response = await fetchCatalogRequest(undefined);
+	}
+	if (!response.ok) {
+		throw new Error(`Requesty model list failed: HTTP ${response.status} ${response.statusText}`);
+	}
+	const payload = (await response.json()) as { data?: RequestyModelEntry[] };
+	const models = (payload.data ?? []).filter(isChatEntry).map((entry) => mapModel(entry, baseUrl));
+	if (models.length === 0) {
+		throw new Error("Requesty model list returned no chat models");
+	}
+	return models;
+}
+
+export async function refreshModels(context: RefreshModelsContext): Promise<RequestyModel[]> {
 	const baseUrl = context.baseUrl ?? DEFAULT_BASE_URL;
 	// The store is keyed by provider ID; normalize entries against the current config.
-	const stored = ((context.stored?.models ?? []) as Model<"openai-completions">[])
+	const stored = ((context.stored?.models ?? []) as RequestyModel[])
 		.filter((model) => model.provider === PROVIDER_ID)
 		.map((model) => ({ ...model, baseUrl }));
 
-	// Offline phase: restore the persisted catalog before any network access,
-	// so models are selectable even when the refresh cannot run.
+	// Offline phase: serve the persisted catalog, falling back to the startup
+	// bootstrap, so models stay selectable without network access.
 	if (!context.allowNetwork) {
-		console.error(`[pi-requesty] offline phase, stored=${stored.length}`); // TODO debug
-		return stored;
+		return stored.length > 0 ? stored : (bootstrapModels ?? []);
 	}
 
 	// Serve a fresh persisted snapshot without re-fetching.
@@ -95,50 +136,34 @@ export async function refreshModels(context: RefreshModelsContext): Promise<Mode
 		return stored;
 	}
 
-	if (context.signal.aborted) return stored;
+	if (context.signal.aborted) return stored.length > 0 ? stored : (bootstrapModels ?? []);
 
-	// Network phase only runs after Pi resolves a credential, so the key comes
-	// from auth.json via /login requesty. The endpoint also answers without
-	// authentication; the key scopes the catalog to the organization's models.
+	// Key-scoped refresh: the credential comes from auth.json (/login requesty);
+	// Pi runs this phase only after credential resolution. A superseding refresh
+	// may abort it — that is fine, the bootstrap catalog already serves models.
 	const apiKey = context.credential?.type === "api_key" ? context.credential.key : undefined;
-	console.error(`[pi-requesty] network phase, key=${apiKey ? "yes" : "no"}`); // TODO debug
-	const fetchCatalog = (headers: HeadersInit | undefined) =>
-		fetch(`${baseUrl}/models`, { headers, signal: context.signal });
-	let response: Response;
-	try {
-		response = await fetchCatalog(apiKey ? { Authorization: `Bearer ${apiKey}` } : undefined);
-	} catch (error) {
-		console.error(`[pi-requesty] fetch threw: ${error}`); // TODO debug
-		throw error;
-	}
-	// An absent or rejected key still deserves model discovery: fall back to the
-	// public catalog on authentication failures. Chat requests keep using the key,
-	// so a bad key fails loudly there instead of hiding models.
-	if ((response.status === 401 || response.status === 403) && apiKey) {
-		response = await fetchCatalog(undefined);
-	}
-	if (!response.ok) {
-		console.error(`[pi-requesty] catalog HTTP ${response.status}`); // TODO debug
-		throw new Error(`Requesty model list failed: HTTP ${response.status} ${response.statusText}`);
-	}
-	const payload = (await response.json()) as { data?: RequestyModelEntry[] };
-	const models = (payload.data ?? []).filter(isChatEntry).map((entry) => mapModel(entry, baseUrl));
-	console.error(`[pi-requesty] mapped ${models.length} models`); // TODO debug
-	if (models.length === 0) {
-		throw new Error("Requesty model list returned no chat models");
-	}
+	const models = await fetchCatalog(baseUrl, apiKey, context.signal);
 
 	// Persist so the catalog is available offline and on the next startup.
 	await context.publish({ persist: { models, checkedAt: Date.now() } });
 	return models;
 }
 
-export default function (pi: ExtensionAPI): void {
-	console.error("[pi-requesty] factory executing"); // TODO: remove debug
+export default async function (pi: ExtensionAPI): Promise<void> {
+	let models: RequestyModel[] | undefined;
+	if (process.env.PI_OFFLINE !== "1") {
+		try {
+			models = await fetchCatalog(DEFAULT_BASE_URL, undefined, AbortSignal.timeout(BOOTSTRAP_TIMEOUT_MS));
+		} catch {
+			// Startup must not fail over model discovery; refreshModels still runs later.
+		}
+	}
+	bootstrapModels = models;
 	pi.registerProvider(PROVIDER_ID, {
 		name: "Requesty",
 		baseUrl: DEFAULT_BASE_URL,
 		api: "openai-completions",
+		models,
 		refreshModels,
 	});
 }

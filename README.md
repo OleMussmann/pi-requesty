@@ -7,9 +7,10 @@ OpenAI-compatible router) discovered live from `GET /v1/models`.
 - Streaming, request format, and `Authorization: Bearer` authentication come from
   Pi's built-in OpenAI Chat Completions implementation — no custom stream code.
 - The API key is stored in `~/.pi/agent/auth.json` through `/login requesty`.
-- The catalog (IDs, context windows, costs, vision/reasoning flags) is refreshed
-  from `https://router.requesty.ai/v1/models` at most once a day and persisted, so
-  models stay selectable offline.
+- The catalog (IDs, context windows, costs, vision/reasoning flags) is fetched
+  from `https://router.requesty.ai/v1/models` once per startup (public,
+  unauthenticated), persisted, and re-refreshed with the key at most once a day —
+  so models stay selectable offline.
 
 ## Install
 
@@ -46,9 +47,16 @@ pi auth check --provider requesty   # prints ready / not_ready / invalid
   mapping is applied yet.
 - Costs are `price × 1e6` from the catalog; cache-write pricing is reported as 0
   because Requesty does not publish it.
-- The network refresh runs only after `/login requesty` (Pi resolves a credential
-  before any remote catalog fetch); the first run therefore shows models only after
-  login.
+- Pi lists a provider's models only once it has a usable credential, so `/login
+  requesty` is required before `/model` shows them. The catalog itself is already
+  loaded by then (startup fetch + persisted store), so discovery does not wait on
+  a refresh.
+- The key-scoped refresh sends `Authorization: Bearer <key>` to `GET /v1/models`
+  (the catalog is then scoped to models approved for your organization) and retries
+  unauthenticated if the key is rejected (HTTP 401/403). A bad key therefore still
+  gets models; it fails loudly only when actually chatting.
+- `pi auth check --provider requesty` reports `provider_not_found`: on Pi 1.2.0 the
+  auth commands run before extensions load, so they only know built-in providers.
 
 ## Development
 
