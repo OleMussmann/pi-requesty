@@ -1,0 +1,37 @@
+{
+  "name": "pi-requesty",
+  "version": "0.1.0",
+  "description": "Pi extension that adds Requesty (router.requesty.ai) as a model provider with a live-refreshed model catalog and API-key storage in auth.json.",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/OleMussmann/pi-requesty.git"
+  },
+  "homepage": "https://github.com/OleMussmann/pi-requesty",
+  "bugs": {
+    "url": "https://github.com/OleMussmann/pi-requesty/issues"
+  },
+  "keywords": [
+    "pi-package",
+    "pi",
+    "extension",
+    "requesty",
+    "provider"
+  ],
+  "license": "MIT",
+  "author": {
+    "name": "Ole Mussmann"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}
