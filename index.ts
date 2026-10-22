@@ -79,7 +79,10 @@ export async function refreshModels(context: RefreshModelsContext): Promise<Mode
 
 	// Offline phase: restore the persisted catalog before any network access,
 	// so models are selectable even when the refresh cannot run.
-	if (!context.allowNetwork) return stored;
+	if (!context.allowNetwork) {
+		console.error(`[pi-requesty] offline phase, stored=${stored.length}`); // TODO debug
+		return stored;
+	}
 
 	// Serve a fresh persisted snapshot without re-fetching.
 	const checkedAt = context.stored?.checkedAt;
@@ -98,15 +101,29 @@ export async function refreshModels(context: RefreshModelsContext): Promise<Mode
 	// from auth.json via /login requesty. The endpoint also answers without
 	// authentication; the key scopes the catalog to the organization's models.
 	const apiKey = context.credential?.type === "api_key" ? context.credential.key : undefined;
-	const response = await fetch(`${baseUrl}/models`, {
-		headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : undefined,
-		signal: context.signal,
-	});
+	console.error(`[pi-requesty] network phase, key=${apiKey ? "yes" : "no"}`); // TODO debug
+	const fetchCatalog = (headers: HeadersInit | undefined) =>
+		fetch(`${baseUrl}/models`, { headers, signal: context.signal });
+	let response: Response;
+	try {
+		response = await fetchCatalog(apiKey ? { Authorization: `Bearer ${apiKey}` } : undefined);
+	} catch (error) {
+		console.error(`[pi-requesty] fetch threw: ${error}`); // TODO debug
+		throw error;
+	}
+	// An absent or rejected key still deserves model discovery: fall back to the
+	// public catalog on authentication failures. Chat requests keep using the key,
+	// so a bad key fails loudly there instead of hiding models.
+	if ((response.status === 401 || response.status === 403) && apiKey) {
+		response = await fetchCatalog(undefined);
+	}
 	if (!response.ok) {
+		console.error(`[pi-requesty] catalog HTTP ${response.status}`); // TODO debug
 		throw new Error(`Requesty model list failed: HTTP ${response.status} ${response.statusText}`);
 	}
 	const payload = (await response.json()) as { data?: RequestyModelEntry[] };
 	const models = (payload.data ?? []).filter(isChatEntry).map((entry) => mapModel(entry, baseUrl));
+	console.error(`[pi-requesty] mapped ${models.length} models`); // TODO debug
 	if (models.length === 0) {
 		throw new Error("Requesty model list returned no chat models");
 	}
@@ -117,6 +134,7 @@ export async function refreshModels(context: RefreshModelsContext): Promise<Mode
 }
 
 export default function (pi: ExtensionAPI): void {
+	console.error("[pi-requesty] factory executing"); // TODO: remove debug
 	pi.registerProvider(PROVIDER_ID, {
 		name: "Requesty",
 		baseUrl: DEFAULT_BASE_URL,
